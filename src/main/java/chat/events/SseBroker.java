@@ -1,6 +1,7 @@
 package chat.events;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -25,7 +26,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <ul>
  *   <li>{@code message} — новое сообщение;</li>
  *   <li>{@code delivered} — сообщения помечены DELIVERED;</li>
- *   <li>{@code read} — сообщения помечены READ.</li>
+ *   <li>{@code read} — сообщения помечены READ;</li>
+ *   <li>{@code user} — новый пользователь.</li>
  * </ul>
  */
 public final class SseBroker implements AutoCloseable {
@@ -89,10 +91,9 @@ public final class SseBroker implements AutoCloseable {
     public Runnable subscribe(long userId, Writer writer) {
         Subscriber sub = new Subscriber(userId);
         subscribers.computeIfAbsent(userId, k -> new CopyOnWriteArrayList<>()).add(sub);
-        Thread pump = Thread.ofVirtual().start(() -> pump(sub, writer));
+        pump(sub, writer);
         return () -> {
             sub.closed.set(true);
-            pump.interrupt();
         };
     }
 
@@ -118,16 +119,39 @@ public final class SseBroker implements AutoCloseable {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            throw ex;
         } finally {
             remove(sub);
         }
     }
 
     /**
+     * Публикует событие всем активным подпискам пользователей, кроме указанного
+     *
+     * @param userId идентификатор пользователя-не-получателя события
+     * @param type   тип события (message / delivered / read / user)
+     * @param json   JSON-тело события (однострочное)
+     */
+    public void publishOther(long userId, String type, String json) {
+        List<Subscriber> list = new ArrayList<>();
+        subscribers.forEach((id, subscribers) -> {
+            if (id != userId) {
+                list.addAll(subscribers);
+            }
+        });
+        if (list == null) {
+            return;
+        }
+        publish(list, type, json);
+    }
+
+    /**
      * Публикует событие всем активным подпискам пользователя.
      *
      * @param userId идентификатор пользователя-получателя события
-     * @param type   тип события (message / delivered / read)
+     * @param type   тип события (message / delivered / read / user)
      * @param json   JSON-тело события (однострочное)
      */
     public void publish(long userId, String type, String json) {
@@ -135,6 +159,17 @@ public final class SseBroker implements AutoCloseable {
         if (list == null) {
             return;
         }
+        publish(list, type, json);
+    }
+
+    /**
+     * Публикует событие всем активным подпискам пользователя.
+     *
+     * @param list   общий список подписок
+     * @param type   тип события (message / delivered / read / user)
+     * @param json   JSON-тело события (однострочное)
+     */
+    private void publish(List<Subscriber> list, String type, String json) {
         String event = "event: " + type + "\ndata: " + json.replace("\n", " ") + "\n\n";
         for (Subscriber sub : list) {
             if (sub.closed.get()) {

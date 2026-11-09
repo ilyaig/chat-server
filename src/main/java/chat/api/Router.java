@@ -18,7 +18,7 @@ import java.util.Map;
  * Регистрация REST-эндпоинтов и SSE-потока, единая обработка ошибок.
  *
  * <p>Каждый обработчик обёрнут: проверка метода → авторизация (если нужна) →
- * бизнес-логика → сериализация ответа. {@link Errors.ApiError} превращается
+ * бизнес-логика → сериализация ответа. {@link ApiError} превращается
  * в HTTP-ответ с соответствующим статусом, прочие исключения — в 500
  * с записью стека в лог. Соединение закрывается в любом случае.
  */
@@ -96,7 +96,7 @@ public final class Router {
                 } else {
                     action.handle(exchange);
                 }
-            } catch (Errors.ApiError e) {
+            } catch (ApiError e) {
                 HttpUtil.sendJson(exchange, e.status, Map.of("error", e.getMessage()));
             } catch (Exception e) {
                 e.printStackTrace();
@@ -158,7 +158,7 @@ public final class Router {
             }
             unsubscribe.run();
             exchange.close();
-        } catch (Errors.ApiError e) {
+        } catch (ApiError e) {
             HttpUtil.sendJson(exchange, e.status, Map.of("error", e.getMessage()));
         } catch (Exception e) {
             e.printStackTrace();

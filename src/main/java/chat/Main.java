@@ -1,6 +1,5 @@
 package chat;
 
-import chat.api.Json;
 import chat.api.Router;
 import chat.auth.Auth;
 import chat.db.Db;
@@ -48,8 +47,8 @@ public final class Main {
 
         Db db = new Db(url, user, password, 16);
         db.migrate();
-        Auth auth = new Auth(db);
         SseBroker events = new SseBroker();
+        Auth auth = new Auth(db, events);
         ChatHandlers handlers = new ChatHandlers(db, events);
         Router router = new Router(auth);
 

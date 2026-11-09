@@ -1,7 +1,11 @@
 package chat.auth;
 
-import chat.api.Errors;
+import chat.api.ApiError;
+import chat.api.Json;
 import chat.db.Db;
+import chat.dto.Token;
+import chat.events.SseBroker;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.sun.net.httpserver.HttpExchange;
 
@@ -10,8 +14,8 @@ import javax.crypto.spec.PBEKeySpec;
 import java.security.SecureRandom;
 import java.sql.SQLException;
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
+
+import static chat.helper.TimeHelper.iso;
 
 /**
  * Регистрация, вход и проверка bearer-токенов.
@@ -30,6 +34,7 @@ public final class Auth {
     private static final int ITERATIONS = 210_000;
 
     private final Db db;
+    private final SseBroker events;
     private final SecureRandom random = new SecureRandom();
 
     /**
@@ -37,8 +42,9 @@ public final class Auth {
      *
      * @param db пул соединений БД
      */
-    public Auth(Db db) {
+    public Auth(Db db, SseBroker events) {
         this.db = db;
+        this.events = events;
     }
 
     /**
@@ -48,40 +54,42 @@ public final class Auth {
      * Повторный логин возвращает 409.
      *
      * @param body JSON-тело: {@code {"username": "...", "password": "..."}}
-     * @return {@code {"ok": true}}
-     * @throws Exception при сбое обращения к БД
-     * @throws Errors.ApiError 400 при некорректных данных, 409 при занятом логине
      */
-    public Map<String, Object> register(JsonNode body) throws Exception {
+    public Token register(JsonNode body) throws JsonProcessingException {
         String username = text(body, "username");
         String password = text(body, "password");
         if (username.length() < 3 || username.length() > 32) {
-            throw new Errors.ApiError(400, "Имя пользователя должно быть от 3 до 32 символов");
+            throw new ApiError(400, "Имя пользователя должно быть от 3 до 32 символов");
         }
         if (password.length() < 6) {
-            throw new Errors.ApiError(400, "Пароль должен быть не короче 6 символов");
+            throw new ApiError(400, "Пароль должен быть не короче 6 символов");
         }
 
         byte[] salt = new byte[16];
         random.nextBytes(salt);
         String stored = "pbkdf2$" + Base64.getEncoder().encodeToString(salt) + "$" + hash(password, salt);
 
-        try {
-            db.inTransaction(c -> {
-                try (var ps = c.prepareStatement("INSERT INTO users(username, password_hash) VALUES (?,?)")) {
+        AuthUser user = db.inTransaction(c -> {
+                try (var ps = c.prepareStatement(AuthQuery.ADD_USER)) {
                     ps.setString(1, username);
                     ps.setString(2, stored);
-                    ps.executeUpdate();
+                    var rs = ps.executeQuery();
+                    rs.next();
+                    return new AuthUser(rs.getLong("id"),
+                            null,
+                                username,
+                                iso(rs.getTimestamp("created_at")));
+                } catch (RuntimeException e) {
+                    if (e.getCause() instanceof SQLException sqle && "23505".equals(sqle.getSQLState())) {
+                        throw new ApiError(409, "Имя пользователя уже занято");
+                    }
+                    throw e;
                 }
-                return null;
             });
-        } catch (RuntimeException e) {
-            if (e.getCause() instanceof SQLException sqle && "23505".equals(sqle.getSQLState())) {
-                throw new Errors.ApiError(409, "Имя пользователя уже занято");
-            }
-            throw e;
-        }
-        return Map.of("ok", true);
+
+        String userJson = Json.MAPPER.writeValueAsString(user.getUser());
+        events.publishOther(user.getId(), "user", userJson);
+        return createToken(user.getId(), username);
     }
 
     /**
@@ -89,44 +97,49 @@ public final class Auth {
      *
      * @param body JSON-тело: {@code {"username": "...", "password": "..."}}
      * @return {@code {"token": "...", "username": "..."}}
-     * @throws Exception при сбое обращения к БД
-     * @throws Errors.ApiError 401 при неверном логине или пароле
      */
-    public Map<String, Object> login(JsonNode body) throws Exception {
+    public Token login(JsonNode body) {
         String username = text(body, "username");
         String password = text(body, "password");
 
-        record Row(long id, String hash) {
-        }
-        Row row = db.readOnly(c -> {
-            try (var ps = c.prepareStatement("SELECT id, password_hash FROM users WHERE username = ?")) {
+        AuthUser user = db.readOnly(c -> {
+            try (var ps = c.prepareStatement(AuthQuery.GET_USER_BY_LOGIN)) {
                 ps.setString(1, username);
                 var rs = ps.executeQuery();
                 if (!rs.next()) {
-                    throw new Errors.ApiError(401, "Неверное имя пользователя или пароль");
+                    throw new ApiError(401, "Неверное имя пользователя или пароль");
                 }
-                return new Row(rs.getLong("id"), rs.getString("password_hash"));
+                return new AuthUser(rs.getLong("id"), rs.getString("password_hash"));
             }
         });
 
-        if (!verify(password, row.hash())) {
-            throw new Errors.ApiError(401, "Неверное имя пользователя или пароль");
+        if (!verify(password, user.getHash())) {
+            throw new ApiError(401, "Неверное имя пользователя или пароль");
         }
 
+        return createToken(user.getId(), username);
+    }
+
+    /**
+     * Создать токен
+     * @param id идентификатор пользователя
+     * @param username логин
+     */
+    private Token createToken(long id, String username) {
         byte[] tokenBytes = new byte[32];
         random.nextBytes(tokenBytes);
         String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
 
         db.inTransaction(c -> {
-            try (var ps = c.prepareStatement("INSERT INTO tokens(token, user_id) VALUES (?,?)")) {
+            try (var ps = c.prepareStatement(AuthQuery.ADD_TOKEN)) {
                 ps.setString(1, token);
-                ps.setLong(2, row.id());
+                ps.setLong(2, id);
                 ps.executeUpdate();
             }
             return null;
         });
 
-        return new HashMap<>(Map.of("token", token, "username", username));
+        return new Token(token, username);
     }
 
     /**
@@ -134,12 +147,12 @@ public final class Auth {
      *
      * @param exchange HTTP-обмен
      * @return сессия пользователя
-     * @throws Errors.ApiError 401, если заголовка нет или токен недействителен
+     * @throws ApiError 401, если заголовка нет или токен недействителен
      */
     public Session requireUser(HttpExchange exchange) {
         String header = exchange.getRequestHeaders().getFirst("Authorization");
         if (header == null || !header.startsWith("Bearer ")) {
-            throw new Errors.ApiError(401, "Требуется авторизация");
+            throw new ApiError(401, "Требуется авторизация");
         }
         return requireToken(header.substring("Bearer ".length()).trim());
     }
@@ -149,11 +162,11 @@ public final class Auth {
      *
      * @param token bearer-токен или {@code null}
      * @return сессия пользователя
-     * @throws Errors.ApiError 401, если токена нет или он недействителен
+     * @throws ApiError 401, если токена нет или он недействителен
      */
     public Session requireToken(String token) {
         if (token == null || token.isBlank()) {
-            throw new Errors.ApiError(401, "Требуется авторизация");
+            throw new ApiError(401, "Требуется авторизация");
         }
         return findByToken(token);
     }
@@ -166,12 +179,11 @@ public final class Auth {
      */
     private Session findByToken(String token) {
         return db.readOnly(c -> {
-            try (var ps = c.prepareStatement(
-                    "SELECT u.id, u.username FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token = ?")) {
+            try (var ps = c.prepareStatement(AuthQuery.GET_USER_BY_TOKEN)) {
                 ps.setString(1, token);
                 var rs = ps.executeQuery();
                 if (!rs.next()) {
-                    throw new Errors.ApiError(401, "Недействительный токен");
+                    throw new ApiError(401, "Недействительный токен");
                 }
                 return new Session(rs.getLong("id"), rs.getString("username"));
             }
@@ -184,12 +196,12 @@ public final class Auth {
      * @param body  JSON-тело
      * @param field имя поля
      * @return значение поля
-     * @throws Errors.ApiError 400, если поле отсутствует или не строка
+     * @throws ApiError 400, если поле отсутствует или не строка
      */
     private static String text(JsonNode body, String field) {
         JsonNode node = body.get(field);
         if (node == null || !node.isTextual()) {
-            throw new Errors.ApiError(400, "Поле '" + field + "' обязательно");
+            throw new ApiError(400, "Поле '" + field + "' обязательно");
         }
         return node.asText();
     }

@@ -1,5 +1,8 @@
 package chat.db;
 
+import chat.helper.FileHelper;
+
+import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
@@ -122,39 +125,12 @@ public final class Db implements AutoCloseable {
 
     /**
      * Идемпотентная миграция схемы БД.
-     *
-     * @throws Exception если выполнить DDL не удалось
      */
-    public void migrate() throws Exception {
+    public void migrate() throws IOException {
+        String initMigrate = FileHelper.readResource("migrate/init.sql");
         readOnly(c -> {
             try (Statement st = c.createStatement()) {
-                st.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            id            BIGSERIAL PRIMARY KEY,
-                            username      VARCHAR(32) UNIQUE NOT NULL,
-                            password_hash TEXT NOT NULL,
-                            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-                        )""");
-                st.execute("""
-                        CREATE TABLE IF NOT EXISTS tokens (
-                            token      TEXT PRIMARY KEY,
-                            user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                        )""");
-                st.execute("""
-                        CREATE TABLE IF NOT EXISTS messages (
-                            id           BIGSERIAL PRIMARY KEY,
-                            sender_id    BIGINT NOT NULL REFERENCES users(id),
-                            recipient_id BIGINT NOT NULL REFERENCES users(id),
-                            text         TEXT NOT NULL,
-                            status       SMALLINT NOT NULL DEFAULT 0,  -- 0=SENT, 1=DELIVERED, 2=READ
-                            created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-                            delivered_at TIMESTAMPTZ,
-                            read_at      TIMESTAMPTZ
-                        )""");
-                st.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_messages_pair
-                        ON messages (LEAST(sender_id, recipient_id), GREATEST(sender_id, recipient_id), id)""");
+                st.execute(initMigrate);
             }
             return null;
         });
